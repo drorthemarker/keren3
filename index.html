@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Text Synchronizer - NLP Demo</title>
+    <style>
+        :root { --highlight-color: #FFD700; --primary-blue: #007bff; --mic-active-color: #dc3545; --light-gray: #6c757d; --orange-color: #fd7e14; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: column; align-items: center; background-color: #f4f4f9; margin: 0; padding: 20px; box-sizing: border-box; }
+        .container { width: 90%; max-width: 900px; background: white; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); padding: 20px; margin-top: 15px; }
+        #file-selection { width: 90%; max-width: 900px; margin-bottom: 20px; text-align: right; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        .file-upload-area { display: flex; justify-content: space-around; gap: 15px; margin-bottom: 20px; }
+        #text-display { height: 20vh; overflow-y: auto; border: 1px solid #ddd; padding: 15px; font-size: 24px; line-height: 2.3; margin-bottom: 20px; display: flex; align-items: center; justify-content: center; }
+        #text-display span.highlight-chunk { background-color: var(--highlight-color); color: black; border-radius: 4px; }
+        .controls { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; align-items: center; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 5px; background-color: var(--primary-blue); color: white; transition: background-color 0.2s; min-width: 180px; text-align: center;}
+        button.upload-btn { background-color: var(--light-gray); flex-grow: 1; }
+        button#play-mic-btn.active { background-color: var(--mic-active-color); }
+        button#restart-btn { background-color: var(--orange-color); }
+        button:hover:not(:disabled) { opacity: 0.85; }
+        button:disabled { background-color: #a0a0a0; cursor: not-allowed; }
+        .font-controls { display: flex; gap: 5px; }
+        .font-controls button { min-width: 45px; font-size: 20px; font-weight: bold; }
+        #status { font-size: 16px; color: #333; height: 20px; margin-top: 15px; text-align: center;}
+    </style>
+</head>
+<body>
+    <h1>מסנכרן אודיו וטקסט - הדגמת NLP</h1>
+
+    <div id="file-selection">
+        <h2>אנא העלה את הקבצים שלך:</h2>
+        <div class="file-upload-area">
+            <input type="file" id="audio-file-input" accept=".wav,audio/wav" style="display: none;">
+            <input type="file" id="timestamp-file-input" accept=".txt,text/plain" style="display: none;">
+            <button id="upload-audio-btn" class="upload-btn">בחר קובץ שמע (wav)</button>
+            <button id="upload-sync-btn" class="upload-btn">בחר קובץ תזמונים (txt)</button>
+        </div>
+        <button id="load-files-btn" disabled>טען קבצים</button>
+    </div>
+
+    <p id="status">בחר קובץ שמע וקובץ תזמונים כדי להפעיל את כפתור הטעינה.</p>
+
+    <div class="container" style="display: none;">
+        <div id="text-display"></div>
+        <div class="controls">
+            <button id="play-chunk-btn" disabled>נגן מקטע הבא</button>
+            <button id="play-mic-btn" disabled>התחל עם מיקרופון</button>
+            <button id="restart-btn" disabled>התחל מחדש</button>
+            <div class="font-controls">
+                <button id="font-decrease-btn" title="הקטן גופן">-</button>
+                <button id="font-increase-btn" title="הגדל גופן">+</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const isSpeechRecognitionSupported = SpeechRecognition != null;
+
+        const elements = {
+            textDisplay: document.getElementById('text-display'),
+            playChunkBtn: document.getElementById('play-chunk-btn'),
+            playMicBtn: document.getElementById('play-mic-btn'),
+            restartBtn: document.getElementById('restart-btn'),
+            fontIncreaseBtn: document.getElementById('font-increase-btn'),
+            fontDecreaseBtn: document.getElementById('font-decrease-btn'),
+            status: document.getElementById('status'),
+            container: document.querySelector('.container'),
+            loadFilesBtn: document.getElementById('load-files-btn'),
+            audioFileInput: document.getElementById('audio-file-input'),
+            timestampFileInput: document.getElementById('timestamp-file-input'),
+            uploadAudioBtn: document.getElementById('upload-audio-btn'),
+            uploadSyncBtn: document.getElementById('upload-sync-btn'),
+        };
+
+        let audioContext, audioBuffer, currentChunkSource;
+        let recognition, isMicrophoneMode = false;
+        let currentFontSize = 24;
+
+        let state = {
+            timestamps: [],
+            chunkIndex: 0,
+        };
+        
+        // --- NLP ANALYSIS RESULTS ---
+        // This array is the result of the "server-side" NLP analysis.
+        // It contains the start and end word indices for each natural phrase.
+        const nlpChunks = [
+            { start: 0, end: 3 }, { start: 4, end: 10 }, { start: 11, end: 16 }, { start: 17, end: 20 },
+            { start: 21, end: 25 }, { start: 26, end: 27 }, { start: 28, end: 38 }, { start: 39, end: 46 },
+            { start: 47, end: 53 }, { start: 54, end: 60 }, { start: 61, end: 68 }, { start: 69, end: 74 },
+            { start: 75, end: 80 }, { start: 81, end: 85 }, { start: 86, end: 91 }, { start: 92, end: 98 },
+            { start: 99, end: 104 }, { start: 105, end: 112 }, { start: 113, end: 120 }, { start: 121, end: 125 },
+            { start: 126, end: 133 }, { start: 134, end: 140 }, { start: 141, end: 147 }, { start: 148, end: 151 },
+            { start: 152, end: 157 }, { start: 158, end: 164 }, { start: 165, end: 171 }, { start: 172, end: 178 },
+            { start: 179, end: 184 }, { start: 185, end: 191 }, { start: 192, end: 196 }, { start: 197, end: 203 },
+            { start: 204, end: 209 }, { start: 210, end: 216 }, { start: 217, end: 221 }, { start: 222, end: 228 },
+            { start: 229, end: 236 }, { start: 237, end: 242 }, { start: 243, end: 247 }, { start: 248, end: 254 },
+            { start: 255, end: 261 }, { start: 262, end: 265 }, { start: 266, end: 271 }, { start: 272, end: 279 },
+            { start: 280, end: 285 }, { start: 286, end: 292 }, { start: 293, end: 298 }, { start: 299, end: 304 },
+            { start: 305, end: 309 }, { start: 310, end: 315 }, { start: 316, end: 323 }, { start: 324, end: 330 },
+            { start: 331, end: 336 }, { start: 337, end: 341 }, { start: 342, end: 348 }, { start: 349, end: 356 },
+            { start: 357, end: 362 }, { start: 363, end: 368 }, { start: 369, end: 375 }, { start: 376, end: 382 },
+            { start: 383, end: 388 }, { start: 389, end: 395 }, { start: 396, end: 402 }, { start: 403, end: 408 },
+            { start: 409, end: 414 }, { start: 415, end: 420 }, { start: 421, end: 426 }, { start: 427, end: 432 },
+            { start: 433, end: 438 }, { start: 439, end: 444 }, { start: 445, end: 450 }, { start: 451, end: 457 },
+            { start: 458, end: 464 }, { start: 465, end: 470 }, { start: 471, end: 476 }, { start: 477, end: 483 },
+            { start: 484, end: 489 }, { start: 490, end: 495 }, { start: 496, end: 501 }, { start: 502, end: 508 },
+            { start: 509, end: 515 }, { start: 516, end: 521 }, { start: 522, end: 527 }, { start: 528, end: 533 },
+            { start: 534, end: 540 }, { start: 541, end: 547 }, { start: 548, end: 553 }, { start: 554, end: 559 },
+            { start: 560, end: 565 }, { start: 566, end: 572 }, { start: 573, end: 578 }, { start: 579, end: 585 },
+            { start: 586, end: 591 }, { start: 592, end: 597 }, { start: 598, end: 604 }
+        ];
+        let nlpChunkIndex = 0;
+        
+        window.addEventListener('DOMContentLoaded', () => {
+            if (!isSpeechRecognitionSupported) {
+                elements.playMicBtn.disabled = true;
+                elements.playMicBtn.textContent = 'מיקרופון לא נתמך';
+            }
+        });
+
+        function checkFilesSelected() {
+            const audioFile = elements.audioFileInput.files[0];
+            const timestampFile = elements.timestampFileInput.files[0];
+            elements.loadFilesBtn.disabled = !(audioFile && timestampFile);
+            if (audioFile && timestampFile) {
+                 elements.status.textContent = 'קבצים נבחרו. לחץ על "טען קבצים" כדי להמשיך.';
+            }
+        }
+
+        elements.uploadAudioBtn.addEventListener('click', () => elements.audioFileInput.click());
+        elements.uploadSyncBtn.addEventListener('click', () => elements.timestampFileInput.click());
+
+        elements.audioFileInput.addEventListener('change', () => {
+            const file = elements.audioFileInput.files[0];
+            if (file) elements.uploadAudioBtn.textContent = file.name;
+            checkFilesSelected();
+        });
+
+        elements.timestampFileInput.addEventListener('change', () => {
+            const file = elements.timestampFileInput.files[0];
+            if (file) elements.uploadSyncBtn.textContent = file.name;
+            checkFilesSelected();
+        });
+
+        elements.loadFilesBtn.addEventListener('click', async () => {
+            const audioFile = elements.audioFileInput.files[0];
+            const timestampFile = elements.timestampFileInput.files[0];
+            if (!audioFile || !timestampFile) return;
+
+            resetStateAndUI();
+            elements.status.textContent = `טוען קבצים...`;
+            elements.container.style.display = 'block';
+
+            try {
+                const readFileAsArrayBuffer = (file) => new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsArrayBuffer(file);
+                });
+
+                const readFileAsText = (file) => new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsText(file);
+                });
+
+                const [arrayBuffer, timestampText] = await Promise.all([
+                    readFileAsArrayBuffer(audioFile),
+                    readFileAsText(timestampFile)
+                ]);
+
+                if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                state.timestamps = parseTimestamps(timestampText);
+
+                elements.playChunkBtn.disabled = false;
+                elements.restartBtn.disabled = false;
+                if (isSpeechRecognitionSupported) elements.playMicBtn.disabled = false;
+                elements.status.textContent = 'מוכן. לחץ על כפתור כדי להתחיל.';
+            } catch (error) {
+                console.error("Error during file loading:", error);
+                elements.status.textContent = `שגיאה בטעינת הקבצים: ${error.message}`;
+            }
+        });
+
+        function resetStateAndUI() {
+            if (isMicrophoneMode) pauseMicrophoneMode();
+            if (currentChunkSource) currentChunkSource.stop();
+            audioBuffer = null;
+            state.timestamps = [];
+            nlpChunkIndex = 0; // Reset the NLP chunk index
+            elements.textDisplay.innerHTML = '';
+        }
+
+        function parseTime(timeStr) { let s=0; const m=timeStr.match(/(\d+)m/); if(m)s+=parseInt(m[1])*60; const sec=timeStr.match(/(\d+)s/); if(sec)s+=parseInt(sec[1]); const ms=timeStr.match(/(\d+)ms/); if(ms)s+=parseInt(ms[1])/1000; return s; }
+        function parseTimestamps(text) { return text.split('\n').map(line => { const match = line.trim().match(/\[\s*(.*?)\s*-\s*(.*?)\s*\]\s*(.*)/); return match ? { start: parseTime(match[1]), end: parseTime(match[2]), word: match[3] } : null; }).filter(Boolean); }
+        
+        // --- NLP-DRIVEN CHUNK CALCULATION ---
+        // This function is now extremely simple. It just reads the next pre-calculated chunk.
+        function calculateNextChunk() {
+            if (nlpChunkIndex >= nlpChunks.length) {
+                return { startIdx: -1, endIdx: -1 }; // No more chunks
+            }
+            const chunk = nlpChunks[nlpChunkIndex];
+            nlpChunkIndex++;
+            return { startIdx: chunk.start, endIdx: chunk.end };
+        }
+
+        function renderChunk(startIdx, endIdx) { 
+            elements.textDisplay.innerHTML = ''; 
+            if (startIdx === -1) return; 
+            for (let i = startIdx; i <= endIdx; i++) { 
+                const ts = state.timestamps[i]; 
+                const span = document.createElement('span'); 
+                span.className = 'word highlight-chunk'; 
+                span.textContent = ts.word + '\u00A0'; 
+                elements.textDisplay.appendChild(span); 
+            } 
+        }
+
+        async function processNextChunk(isMicMode = false) {
+            if (audioContext && audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            elements.playChunkBtn.disabled = true;
+            elements.playMicBtn.disabled = true;
+            elements.restartBtn.disabled = true;
+
+            const { startIdx, endIdx } = calculateNextChunk();
+
+            if (startIdx === -1) {
+                elements.status.textContent = "הגעת לסוף!";
+                if (isMicMode) pauseMicrophoneMode();
+                nlpChunkIndex = 0; // Reset for next run
+                elements.textDisplay.innerHTML = '';
+                elements.playChunkBtn.disabled = false;
+                elements.restartBtn.disabled = false;
+                if(isSpeechRecognitionSupported) {
+                    elements.playMicBtn.disabled = false;
+                    elements.playMicBtn.textContent = 'התחל עם מיקרופון';
+                }
+                return;
+            }
+
+            renderChunk(startIdx, endIdx);
+
+            const PRE_START_OFFSET = 0.1;
+            let postEndOffset = 0.2; // Default for the very last phrase
+
+            if (endIdx + 1 < state.timestamps.length) {
+                const lastWordOfChunk = state.timestamps[endIdx];
+                const firstWordOfNextChunk = state.timestamps[endIdx + 1];
+                const silenceGap = firstWordOfNextChunk.start - lastWordOfChunk.end;
+                postEndOffset = Math.min(0.2, silenceGap / 2);
+            }
+            
+            const desiredStartTime = state.timestamps[startIdx].start - PRE_START_OFFSET;
+            const desiredStopTime = state.timestamps[endIdx].end + postEndOffset;
+            const safeStartTime = Math.max(0, desiredStartTime);
+            const safeStopTime = Math.min(audioBuffer.duration, desiredStopTime);
+            const duration = safeStopTime - safeStartTime;
+
+            if (duration <= 0) {
+                console.error(`Invalid duration for chunk starting at index ${startIdx}. Skipping.`);
+                requestAnimationFrame(() => processNextChunk(isMicMode));
+                return;
+            }
+            
+            if (currentChunkSource) currentChunkSource.stop();
+            currentChunkSource = audioContext.createBufferSource();
+            currentChunkSource.buffer = audioBuffer;
+            currentChunkSource.connect(audioContext.destination);
+            
+            currentChunkSource.onended = () => {
+                if (isMicrophoneMode) {
+                    elements.status.textContent = 'תורך, דבר...';
+                    recognition.start();
+                }
+                elements.playChunkBtn.disabled = false;
+                elements.restartBtn.disabled = false;
+                if (isSpeechRecognitionSupported) {
+                    elements.playMicBtn.disabled = false; 
+                }
+            };
+            
+            elements.status.textContent = 'מקשיבים לאודיו...';
+            currentChunkSource.start(0, safeStartTime, duration);
+        }
+
+        elements.playChunkBtn.addEventListener('click', () => {
+            if (isMicrophoneMode || !audioContext || !audioBuffer) return;
+            processNextChunk(false);
+        });
+
+        function setupSpeechRecognition() {
+            if (recognition) return;
+            recognition = new SpeechRecognition();
+            recognition.lang = 'he-IL';
+            recognition.continuous = false;
+            recognition.interimResults = false;
+            recognition.onspeechend = () => {
+                elements.status.textContent = 'הבנתי, מקדם למקטע הבא...';
+                setTimeout(() => processNextChunk(true), 500);
+            };
+            recognition.onerror = (event) => {
+                console.error('Speech recognition error', event.error);
+                if (event.error === 'no-speech' && isMicrophoneMode) {
+                    elements.status.textContent = 'לא שמעתי כלום, נסה שוב...';
+                    recognition.start();
+                } else if (event.error === 'not-allowed') {
+                    elements.status.textContent = 'נדחתה הרשאת גישה למיקרופון.';
+                    pauseMicrophoneMode();
+                }
+            };
+        }
+
+        function startOrResumeMicrophoneMode() {
+            isMicrophoneMode = true;
+            elements.playMicBtn.textContent = 'השהה מיקרופון';
+            elements.playMicBtn.classList.add('active');
+            setupSpeechRecognition();
+            processNextChunk(true);
+        }
+
+        function pauseMicrophoneMode() {
+            isMicrophoneMode = false;
+            if (recognition) recognition.abort();
+            if (currentChunkSource) currentChunkSource.stop();
+            elements.playMicBtn.textContent = 'המשך עם מיקרופון';
+            elements.playMicBtn.classList.remove('active');
+            elements.status.textContent = 'מצב מיקרופון הושהה.';
+            const filesLoaded = audioBuffer && state.timestamps.length > 0;
+            elements.playChunkBtn.disabled = !filesLoaded;
+            elements.restartBtn.disabled = !filesLoaded;
+            if (isSpeechRecognitionSupported) elements.playMicBtn.disabled = !filesLoaded;
+        }
+
+        function restartProcess() {
+            if (isMicrophoneMode) pauseMicrophoneMode();
+            nlpChunkIndex = 0;
+            elements.textDisplay.innerHTML = '';
+            elements.status.textContent = 'התהליך אופס. לחץ על "התחל" כדי להתחיל מההתחלה.';
+            elements.playMicBtn.textContent = 'התחל עם מיקרופון';
+        }
+        elements.restartBtn.addEventListener('click', restartProcess);
+
+        elements.playMicBtn.addEventListener('click', () => {
+            if (isMicrophoneMode) {
+                pauseMicrophoneMode();
+            } else {
+                startOrResumeMicrophoneMode();
+            }
+        });
+        
+        elements.fontIncreaseBtn.addEventListener('click', () => { if (currentFontSize >= 100) return; currentFontSize += 2; elements.textDisplay.style.fontSize = `${currentFontSize}px`; });
+        elements.fontDecreaseBtn.addEventListener('click', () => { if (currentFontSize <= 12) return; currentFontSize -= 2; elements.textDisplay.style.fontSize = `${currentFontSize}px`; });
+    </script>
+</body>
+</html>
